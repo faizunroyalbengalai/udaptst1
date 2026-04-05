@@ -1,0 +1,158 @@
+on:
+  workflow_dispatch:
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+        working-directory: terraform
+
+      - name: Terraform Apply
+        run: |
+          terraform apply -auto-approve \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -var="image_tag=latest" \
+            -var="database_url=${{ secrets.DATABASE_URL }}" \
+            -var="mongo_uri=${{ secrets.MONGO_URI }}" \
+            -var="db_host=${{ secrets.DB_HOST }}" \
+            -var="db_port=${{ secrets.DB_PORT }}" \
+            -var="db_name=${{ secrets.DB_NAME }}" \
+            -var="db_user=${{ secrets.DB_USER }}" \
+            -var="db_password=${{ secrets.DB_PASSWORD }}" \
+            -var="rds_install_db=${{ secrets.RDS_INSTALL_DB }}" \
+            -var="db_type=${{ secrets.DB_TYPE }}" \
+            -var="db_username=${{ secrets.DB_USERNAME }}"
+        working-directory: terraform
+
+  build-and-push:
+    needs: terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        run: |
+          IMAGE="${{ steps.login-ecr.outputs.registry }}/${{ secrets.PROJECT_NAME }}:${{ github.sha }}"
+          IMAGE_LATEST="${{ steps.login-ecr.outputs.registry }}/${{ secrets.PROJECT_NAME }}:latest"
+          docker build -t $IMAGE .
+          docker tag $IMAGE $IMAGE_LATEST
+          docker push $IMAGE
+          docker push $IMAGE_LATEST
+
+  deploy-ecs:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ secrets.PROJECT_NAME }}-cluster \
+            --service ${{ secrets.PROJECT_NAME }}-service \
+            --force-new-deployment
+
+      - name: Wait for ECS service to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ secrets.PROJECT_NAME }}-cluster \
+            --services ${{ secrets.PROJECT_NAME }}-service
+
+  verify:
+    needs: deploy-ecs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+        working-directory: terraform
+
+      - name: Verify application is reachable
+        run: |
+          ALB_URL=$(terraform output -raw alb_url)
+          echo "Checking $ALB_URL ..."
+          for i in $(seq 1 10); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$ALB_URL" || true)
+            echo "Attempt $i: HTTP $STATUS"
+            if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 400 ]; then
+              echo "Application is healthy at $ALB_URL"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "Application did not respond with a healthy status after 10 attempts"
+          exit 1
+        working-directory: terraform
+
+  notify:
+    needs: [deploy-ecs, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Print live URL
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+          ALB_URL=$(terraform output -raw alb_url)
+          echo "============================================"
+          echo "Application is live at: $ALB_URL"
+          echo "Project: ${{ secrets.PROJECT_NAME }}"
+          echo "Region:  ${{ secrets.AWS_REGION }}"
+          echo "Image:   ${{ github.sha }}"
+          echo "============================================"
+        working-directory: terraform
